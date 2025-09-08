@@ -1,7 +1,7 @@
 # PR-Scoped Canary Deployments with Kustomize, Traefik, Linkerd & Argo CD
 
 > Test new versions **per Pull Request** in a real cluster without disrupting others.
-> Requests tagged with `X-Canary: <PR#>` go to canary v2, everything else goes to stable v1.
+> Requests tagged with `X-Canary: <PR#>` go to canary version, everything else goes to stable.
 > Auto-created on PR open, auto-pruned on PR close.
 
 ---
@@ -11,27 +11,17 @@
 * [Why this approach](#why-this-approach)
 * [Architecture](#architecture)
 * [Prerequisites](#prerequisites)
-* [Repository layout](#repository-layout)
-
-  * [Option A: single mono-repo](#option-a-single-mono-repo)
-  * [Option B: service repo + env repo (recommended)](#option-b-service-repo--env-repo-recommended)
-* [Kustomize bases & overlays](#kustomize-bases--overlays)
-
-  * [API service (HTTP edge)](#api-service-http-edge)
-  * [Back-office service (gRPC east–west)](#back-office-service-grpc-eastwest)
-  * [Horizontal Pod Autoscaler (HPA)](#horizontal-pod-autoscaler-hpa)
-* [Traefik routing (edge)](#traefik-routing-edge)
-* [Linkerd routing (east–west)](#linkerd-routing-eastwest)
-* [Argo CD ApplicationSet (per-PR canaries)](#argo-cd-applicationset-perpr-canaries)
+* [Repository Structure](#repository-structure)
+* [Service Architecture](#service-architecture)
+* [Kustomize Configuration](#kustomize-configuration)
+* [Traefik Routing](#traefik-routing)
+* [Linkerd Routing](#linkerd-routing)
+* [Argo CD ApplicationSets](#argo-cd-applicationsets)
 * [GitHub Actions](#github-actions)
-* [Go wiring (summary)](#go-wiring-summary)
-* [Chrome extension (optional)](#chrome-extension-optional)
-* [Promotion & cleanup lifecycle](#promotion--cleanup-lifecycle)
-* [Security, RBAC & quotas](#security-rbac--quotas)
-* [Observability](#observability)
-* [CORS & client notes](#cors--client-notes)
+* [Observability Stack](#observability-stack)
+* [Local Development](#local-development)
+* [Promotion & Cleanup Lifecycle](#promotion--cleanup-lifecycle)
 * [Troubleshooting](#troubleshooting)
-* [FAQ](#faq)
 
 ---
 
@@ -39,7 +29,7 @@
 
 * **Fast feedback** — Every PR deploys a live, isolated canary you can hit immediately.
 * **Zero disruption** — Only requests with `X-Canary: <PR#>` hit the PR namespace; everyone else stays on stable.
-* **Production parity** — Test in the *real* cluster with real deps (DB/Kafka/etc).
+* **Production parity** — Test in the *real* cluster with real dependencies.
 * **Automatic cleanup** — When the PR closes, Argo CD prunes the entire PR namespace automatically.
 * **GitOps alignment** — Everything is declarative, auditable, reproducible.
 * **Easy demos** — Share the header value and a URL; no bespoke staging envs.
@@ -51,304 +41,229 @@
 ## Architecture
 
 * **Web → API (HTTP)** routed by **Traefik**:
+  * `X-Canary: <PR#>` → **`api-service`** in **`api-canary-pr-<PR#>`** namespace
+  * otherwise → **`api-service`** in **`apps`** namespace (stable)
 
-  * `X-Canary: <PR#>` → **`api`** service in **`api-canary-pr-<PR#>`** namespace
-  * otherwise → **`api`** service in **`apps`** namespace (stable)
-* **API → backend (gRPC)** routed by **Linkerd (Gateway API)**:
-
+* **API → Store (gRPC)** routed by **Linkerd (Gateway API)**:
   * Same `X-Canary` value propagated as **gRPC metadata**.
-  * `X-Canary: <PR#>` → **`store`** service in **`store-canary-pr-<PR#>`** namespace
-  * otherwise → **`store`** service in **`apps`** namespace (stable)
+  * `X-Canary: <PR#>` → **`store-service`** in **`store-canary-pr-<PR#>`** namespace
+  * otherwise → **`store-service`** in **`apps`** namespace (stable)
 
 > You'll run **the same base manifests** in different namespaces per PR.
-> An **apex Service** in the stable namespace fronts back-office services with **cross-namespace routing** via GRPCRoute + ReferenceGrant.
+> Cross-namespace routing via GRPCRoute + ReferenceGrant enables east-west traffic.
 
 ---
 
 ## Prerequisites
 
 * Kubernetes cluster with:
-
   * **Argo CD** + **ApplicationSet** controller
-  * **Traefik** (CRDs installed if using `IngressRoute`)
-  * **Linkerd** with **Gateway API dynamic request routing** enabled (`HTTPRoute`/`GRPCRoute`)
-* Container registry (e.g., GHCR, ECR, GCR) and CI secrets to push images
-* DNS for your dev domain (e.g., `api.dev.example.com`)
+  * **Traefik** (CRDs installed for `IngressRoute`)
+  * **Linkerd** with **Gateway API dynamic request routing** enabled
+* Container registry (GHCR) and CI secrets to push images
+* DNS for your dev domain (e.g., `api.localhost`)
 * GitHub token (PAT) for ApplicationSet PR generator
 
 ---
 
-## Repository layout
+## Repository Structure
 
-You can keep everything in one repo or split service code from environment manifests.
-
-### Option A: single mono-repo
+### Current Implementation
 
 ```
-repo-root/
-  services/api/
-    app/...
-    deploy/
-      base/
-        deployment-v1.yaml
-        service-v1.yaml
-        deployment-v2.yaml
-        service-v2.yaml
-        kustomization.yaml
-      edge/                 # edge resources for API
-        ingressroute-template.yaml
-      overlays/
-        stable/
-          kustomization.yaml
-        canary/
-          kustomization.yaml
-  services/store/           # gRPC backend service
-    deploy/...
-  envs/
-    apps/
-      applicationset-api-pr.yaml
-      applicationset-edge-pr.yaml
-      applicationset-billing-pr.yaml
-    dev/
-      api/
-        stable/
-          kustomization.yaml
-        canary/
-          kustomization.yaml
-      backoffice/
-        canary/
-          kustomization.yaml
-```
-
-### Option B: service repo + env repo (**recommended**)
-
-* **Service repo** owns code + **kustomize base** for the service.
-* **Env repo** owns the **overlays**, Argo CD Applications, and ApplicationSets.
-
----
-
-## Kustomize bases & overlays
-
-### API service (HTTP edge) — Single base manifests
-
-**`services/api/deploy/base/deployment.yaml`**
-
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: api
-  labels: { app: api }
-spec:
-  replicas: 2
-  selector: { matchLabels: { app: api } }
-  template:
-    metadata: { labels: { app: api } }
-    spec:
-      containers:
-        - name: api
-          image: ghcr.io/rinsecrm/api-service:STABLE_TAG   # patched per env/PR
-          ports: [{ containerPort: 8080 }]
-```
-
-**`services/api/deploy/base/service.yaml`**
-
-```yaml
-apiVersion: v1
-kind: Service
-metadata:
-  name: api
-  labels: { app: api }
-spec:
-  selector: { app: api }
-  ports: [{ port: 80, targetPort: 8080 }]
-```
-
-**`services/api/deploy/base/kustomization.yaml`**
-
-```yaml
-apiVersion: kustomize.config.k8s.io/v1beta1
-kind: Kustomization
-resources:
-  - deployment.yaml
-  - service.yaml
-  - hpa.yaml
-```
-
-**`envs/dev/api/stable/kustomization.yaml`**
-
-```yaml
-apiVersion: kustomize.config.k8s.io/v1beta1
-kind: Kustomization
-resources:
-  - ../../../../services/api/deploy/base
-  - ingressroute.yaml  # stable Traefik routing
-namespace: apps
-images:
-  - name: ghcr.io/rinsecrm/api-service
-    newTag: v1.0.0   # promotion bumps this
-```
-
-> **No separate canary overlay needed!** ApplicationSet deploys the same base directly to PR namespaces with image patches.
-
-### Back-office service (gRPC east–west) — Cross-namespace routing
-
-The **`store`** service uses the same single-manifest approach. The apex Service in the stable namespace routes to PR namespaces via cross-namespace GRPCRoute.
-
-**`services/store/deploy/base/deployment.yaml`** (same pattern as API)
-
-**`services/store/deploy/base/service.yaml`** (same pattern as API)
-
-**`services/store/deploy/base/grpc-route-template.yaml`**
-
-```yaml
-apiVersion: gateway.networking.k8s.io/v1
-kind: GRPCRoute
-metadata:
-  name: store-canary-pr-{{ number }}
-  namespace: apps  # stable namespace where apex service lives
-spec:
-  parentRefs:
-    - kind: Service
-      name: store        # apex ClusterIP used by callers
-  rules:
-    - matches:
-        - headers:
-            - name: X-Canary
-              value: "{{ number }}"
-      backendRefs:
-        - name: store
-          namespace: store-canary-pr-{{ number }}  # cross-namespace reference
-          port: 80
-    - backendRefs:
-        - name: store
-          namespace: apps  # stable namespace
-          port: 80
-```
-
-**`services/store/deploy/base/reference-grant-template.yaml`**
-
-```yaml
-apiVersion: gateway.networking.k8s.io/v1beta1
-kind: ReferenceGrant
-metadata:
-  name: allow-apps-grpcroute
-  namespace: store-canary-pr-{{ number }}  # target namespace
-spec:
-  from:
-    - group: gateway.networking.k8s.io
-      kind: GRPCRoute
-      namespace: apps         # the route lives here
-  to:
-    - group: ""                     # core/v1 Service
-      kind: Service
-      name: store                   # allow referencing this Service
-```
-
-### Horizontal Pod Autoscaler (HPA)
-
-**`services/api/deploy/base/hpa.yaml`** (same HPA deployed in both stable and PR namespaces)
-
-```yaml
-apiVersion: autoscaling/v2
-kind: HorizontalPodAutoscaler
-metadata:
-  name: api-hpa
-spec:
-  scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: api
-  minReplicas: 2
-  maxReplicas: 10
-  metrics:
-    - type: Resource
-      resource:
-        name: cpu
-        target:
-          type: Utilization
-          averageUtilization: 70
+.
+├── api-service/                    # HTTP REST API service
+│   ├── main.go                     # Application entry point
+│   ├── internal/                   # Internal packages
+│   │   ├── client/                 # gRPC client for store-service
+│   │   ├── server/                 # HTTP handlers and mappers
+│   │   ├── canaryctx/              # Canary context handling
+│   │   ├── metrics/                # Prometheus metrics
+│   │   └── tracing/                # OpenTelemetry tracing
+│   ├── .github/workflows/          # CI/CD workflows
+│   ├── .gitignore                  # Git ignore rules
+│   ├── go.mod                      # Go dependencies
+│   ├── Makefile                    # Build and development tasks
+│   ├── Dockerfile                  # Container image
+│   └── README.md                   # Service documentation
+│
+├── store-service/                  # gRPC backend service
+│   ├── main.go                     # Application entry point
+│   ├── internal/                   # Internal packages
+│   │   ├── data/                   # DynamoDB data layer
+│   │   ├── server/                 # gRPC server implementation
+│   │   ├── canaryctx/              # Canary context handling
+│   │   ├── metrics/                # Prometheus metrics
+│   │   └── tracing/                # OpenTelemetry tracing
+│   ├── proto/                      # Protocol buffer definitions
+│   │   ├── store.proto             # Service definition
+│   │   ├── generate.go             # Code generation
+│   │   ├── go/                     # Generated Go code
+│   │   └── ruby/                   # Ruby gem structure
+│   ├── .github/workflows/          # CI/CD workflows
+│   ├── .gitignore                  # Git ignore rules
+│   ├── go.mod                      # Go dependencies
+│   ├── Makefile                    # Build and development tasks
+│   ├── Dockerfile                  # Container image
+│   └── README.md                   # Service documentation
+│
+├── manifests-microservices/        # Centralized manifests repository
+│   ├── applications/               # Argo CD applications
+│   │   ├── production/             # Production environment
+│   │   ├── staging/                # Staging environment
+│   │   └── integration-001/        # Integration environment
+│   ├── kustomize/                  # Kustomize configurations
+│   │   ├── api-service/            # API service manifests
+│   │   │   ├── base/               # Base manifests
+│   │   │   └── overlays/           # Environment overlays
+│   │   └── store-service/          # Store service manifests
+│   │       ├── base/               # Base manifests
+│   │       └── overlays/           # Environment overlays
+│   └── .github/workflows/          # Manifest update workflows
+│
+├── localdev/                       # Local development setup
+│   ├── infrastructure/             # Helm charts and values
+│   ├── scripts/                    # Helper scripts
+│   ├── docs/                       # Development documentation
+│   ├── Makefile                    # Local development tasks
+│   └── setup.sh                    # Environment setup
+│
+└── extension-canary/               # Chrome extension for testing
+    ├── manifest.json               # Extension manifest
+    ├── src/                        # Extension source code
+    └── README.md                   # Extension documentation
 ```
 
 ---
 
-## Traefik routing (edge) — Namespace-based routing
+## Service Architecture
 
-**Stable** (everyone → `api` service in `apps` namespace):
+### API Service (HTTP Edge)
+- **Language**: Go
+- **Framework**: Standard library with custom HTTP handlers
+- **Protocol**: HTTP REST API
+- **Database**: None (proxies to store-service)
+- **Observability**: Prometheus metrics, OpenTelemetry tracing
+- **Port**: 8080 (HTTP), 9090 (metrics)
 
+### Store Service (gRPC Backend)
+- **Language**: Go
+- **Framework**: gRPC
+- **Protocol**: gRPC
+- **Database**: DynamoDB
+- **Observability**: Prometheus metrics, OpenTelemetry tracing
+- **Port**: 8080 (gRPC), 9090 (metrics)
+
+---
+
+## Kustomize Configuration
+
+### Centralized Manifests
+All Kubernetes manifests are centralized in the `manifests-microservices` repository:
+
+```
+manifests-microservices/
+├── kustomize/
+│   ├── api-service/
+│   │   ├── base/
+│   │   │   ├── deployment.yaml
+│   │   │   ├── service.yaml
+│   │   │   ├── hpa.yaml
+│   │   │   ├── servicemonitor.yaml
+│   │   │   └── kustomization.yaml
+│   │   └── overlays/
+│   │       ├── production/
+│   │       ├── staging/
+│   │       └── integration-001/
+│   └── store-service/
+│       ├── base/
+│       │   ├── deployment.yaml
+│       │   ├── service.yaml
+│       │   ├── hpa.yaml
+│       │   ├── servicemonitor.yaml
+│       │   ├── grpc-route-template.yaml
+│       │   ├── reference-grant-template.yaml
+│       │   └── kustomization.yaml
+│       └── overlays/
+│           ├── production/
+│           ├── staging/
+│           └── integration-001/
+```
+
+### Single Base Manifest Approach
+- **One deployment.yaml per service** - no v1/v2 duplication
+- **Environment-specific overlays** - patch image tags and configurations
+- **PR canaries** - ApplicationSets patch image tags dynamically
+
+---
+
+## Traefik Routing
+
+### Stable Routing
 ```yaml
 apiVersion: traefik.containo.us/v1alpha1
 kind: IngressRoute
 metadata:
-  name: api-stable
+  name: api-service-stable
   namespace: apps
 spec:
-  entryPoints: [ websecure ]
+  entryPoints: [web]
   routes:
-    - match: Host(`api.dev.example.com`) && PathPrefix(`/`)
-      kind: Rule
+    - match: Host(`api.localhost`) && PathPrefix(`/`)
       services:
-        - name: api
+        - name: api-service
           namespace: apps
           port: 80
-  tls: {}
 ```
 
-**Per-PR canary router** (only `X-Canary: <PR#>` → `api` service in that PR's namespace):
-
+### PR Canary Routing
 ```yaml
 apiVersion: traefik.containo.us/v1alpha1
 kind: IngressRoute
 metadata:
-  name: api-canary-pr-{{ number }}
+  name: api-service-canary-pr-{{ number }}
   namespace: apps
 spec:
-  entryPoints: [ websecure ]
+  entryPoints: [web]
   routes:
-    - match: Host(`api.dev.example.com`) && PathPrefix(`/`) && Headers(`X-Canary`, `{{ number }}`)
-      kind: Rule
+    - match: Host(`api.localhost`) && Headers(`X-Canary`, `{{ number }}`)
       services:
-        - name: api
+        - name: api-service
           namespace: api-canary-pr-{{ number }}
           port: 80
-  tls: {}
 ```
-
-> **Key insight**: Same service name (`api`), different **target namespace** based on header value. No v1/v2 service duplication needed.
 
 ---
 
-## Linkerd routing (east–west) — Cross-namespace with ReferenceGrant
+## Linkerd Routing
 
-Per-PR **`GRPCRoute`** for cross-namespace canary routing:
-
+### Cross-Namespace gRPC Routing
 ```yaml
 apiVersion: gateway.networking.k8s.io/v1
 kind: GRPCRoute
 metadata:
-  name: store-canary-pr-{{ number }}
-  namespace: apps  # stable namespace where apex service lives
+  name: store-service-canary-pr-{{ number }}
+  namespace: apps
 spec:
   parentRefs:
     - kind: Service
-      name: store
+      name: store-service
   rules:
     - matches:
         - headers:
             - name: X-Canary
               value: "{{ number }}"
       backendRefs:
-        - name: store
-          namespace: store-canary-pr-{{ number }}  # cross-namespace!
+        - name: store-service
+          namespace: store-canary-pr-{{ number }}
           port: 80
     - backendRefs:
-        - name: store
-          namespace: apps  # stable
+        - name: store-service
+          namespace: apps
           port: 80
 ```
 
-**Required ReferenceGrant** (in target namespace):
-
+### Reference Grant
 ```yaml
 apiVersion: gateway.networking.k8s.io/v1beta1
 kind: ReferenceGrant
@@ -363,389 +278,191 @@ spec:
   to:
     - group: ""
       kind: Service
-      name: store
+      name: store-service
 ```
 
 ---
 
-## Argo CD ApplicationSet (per-PR canaries) — Simplified
+## Argo CD ApplicationSets
 
-> We use **three** ApplicationSets for complete automation:
->
-> 1. Deploy the **PR's API base manifests** to PR namespace
-> 2. Deploy the **edge router** (Traefik) pointing to that namespace  
-> 3. Deploy the **gRPC routing** (GRPCRoute + ReferenceGrant) for cross-namespace access
-
-**1) API canary namespace (deploys base manifests directly)**
-
-`envs/apps/applicationset-api-pr.yaml`
-
-```yaml
-apiVersion: argoproj.io/v1alpha1
-kind: ApplicationSet
-metadata:
-  name: api-pr-canaries
-  namespace: argocd
-spec:
-  generators:
-    - pullRequest:
-        github:
-          owner: rinsecrm
-          repo: api-service
-          tokenRef: { secretName: github-token, key: token }
-        requeueAfterSeconds: 120
-  template:
-    metadata:
-      name: api-canary-pr-{{ number }}
-      labels: { role: canary, app: api, pr: "{{ number }}" }
-    spec:
-      project: canary-deployments
-      destination:
-        server: https://kubernetes.default.svc
-        namespace: api-canary-pr-{{ number }}
-      source:
-        repoURL: https://github.com/rinsecrm/api-service.git
-        targetRevision: "{{ head_sha }}"
-        path: deploy/base
-        kustomize:
-          patches:
-            - target: { kind: Deployment, name: api }
-              patch: |-
-                - op: replace
-                  path: /spec/template/spec/containers/0/image
-                  value: ghcr.io/rinsecrm/api-service:pr-{{ number }}
-      syncPolicy:
-        automated: { prune: true, selfHeal: true }
-        syncOptions:
-          # CreateNamespace removed - using apps namespace
+### Environment-Centric Structure
+```
+manifests-microservices/
+├── applications/
+│   ├── production/
+│   │   ├── api-service-production.yaml
+│   │   └── store-service-production.yaml
+│   ├── staging/
+│   │   ├── api-service-staging.yaml
+│   │   └── store-service-staging.yaml
+│   └── integration-001/
+│       ├── api-service-integration.yaml
+│       ├── store-service-integration.yaml
+│       ├── applicationset-api-service-pr.yaml
+│       ├── applicationset-store-service-pr.yaml
+│       └── applicationset-store-service-routing-pr.yaml
 ```
 
-**2) Edge router per PR (Traefik `IngressRoute`)**
-
-`envs/apps/applicationset-edge-pr.yaml`
-
-```yaml
-apiVersion: argoproj.io/v1alpha1
-kind: ApplicationSet
-metadata:
-  name: api-edge-pr-routers
-  namespace: argocd
-spec:
-  generators:
-    - pullRequest:
-        github:
-          owner: rinsecrm
-          repo: api-service
-          tokenRef: { secretName: github-token, key: token }
-        requeueAfterSeconds: 120
-  template:
-    metadata:
-      name: api-canary-router-pr-{{ number }}
-      labels: { role: canary, pr: "{{ number }}", layer: edge }
-    spec:
-      project: canary-deployments
-      destination:
-        server: https://kubernetes.default.svc
-        namespace: apps
-      source:
-        repoURL: https://github.com/rinsecrm/api-service.git
-        targetRevision: "{{ head_sha }}"
-        path: deploy/edge
-        kustomize:
-          patches:
-            - target: { apiVersion: traefik.containo.us/v1alpha1, kind: IngressRoute, name: api-canary-pr-{{ number }} }
-              patch: |-
-                - op: replace
-                  path: /metadata/name
-                  value: api-canary-pr-{{ number }}
-                - op: replace
-                  path: /spec/routes/0/match
-                  value: "Host(`api.dev.example.com`) && PathPrefix(`/`) && Headers(`X-Canary`, `{{ number }}`)"
-                - op: replace
-                  path: /spec/routes/0/services/0/namespace
-                  value: api-canary-pr-{{ number }}
-      syncPolicy:
-        automated: { prune: true, selfHeal: true }
-```
-
-**3) Store service + cross-namespace routing**
-
-Two ApplicationSets handle store canaries: one for the service deployment, another for GRPCRoute + ReferenceGrant.
-
-> **Key improvement**: All ApplicationSets deploy directly from service repos, no intermediate manifests repo needed!
+### PR Canary ApplicationSets
+- **API Service**: Deploys base manifests to PR namespace
+- **Store Service**: Deploys base manifests to PR namespace  
+- **Store Routing**: Creates GRPCRoute + ReferenceGrant for cross-namespace access
 
 ---
 
 ## GitHub Actions
 
-**Build & push on PR** (in the **service repo**):
+### Generic Workflows
+All workflows use `GITHUB_REPOSITORY` environment variable for dynamic naming:
 
 ```yaml
-name: build-api-pr
-on:
-  pull_request:
-    paths: [ "services/api/**" ]
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build & push
-        env: { IMAGE: ghcr.io/rinsecrm/api-service }
-        run: |
-          TAG=${GITHUB_SHA::8}
-          docker build -t $IMAGE:$TAG services/api
-          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-          docker push $IMAGE:$TAG
+env:
+  GO_VERSION: '1.25.1'
+  DOCKER_IMAGE: ghcr.io/${{ github.repository }}
+  REGISTRY: ghcr.io
 ```
 
-> ApplicationSet will use `pr-{{ number }}` to pick the matching image tag.
+### Workflow Types
+1. **CI Pipeline** - Build and test on PR, build and push on main
+2. **PR Canary** - Build canary image for PR testing
+3. **Release** - Create staging/production PRs and GitHub releases
+
+### Release Process
+1. **Tag creation** triggers release workflow
+2. **Integration** automatically updated to latest
+3. **Staging PR** created for review
+4. **Production PR** created for review
+5. **GitHub Release** created with artifacts
 
 ---
 
-## Go wiring (summary)
+## Observability Stack
 
-* **Gorilla/Mux middleware**: read `X-Canary` (digits only), stash in `context`.
-* **gRPC server interceptor**: read incoming `X-Canary` metadata, re-stash in context.
-* **gRPC client interceptor**: read from context, set `X-Canary` on outgoing calls.
-* This allows Traefik to route HTTP to `api-v2` and Linkerd to route gRPC to `*-v2`.
+### Local Development
+- **Prometheus** - Metrics collection
+- **Grafana** - Visualization and dashboards
+- **Tempo** - Distributed tracing backend
+- **Loki** - Log aggregation
+- **Correlation** - Traces, logs, and metrics linked
 
-> You can keep this in a small internal package (e.g., `internal/canaryctx`) and a common RPC module for interceptors.
+### Application Metrics
+- **HTTP metrics** - Request rate, latency, error rate
+- **gRPC metrics** - Call rate, latency, error rate
+- **Business metrics** - Custom application metrics
+- **ServiceMonitor** - Prometheus scraping configuration
+
+### Distributed Tracing
+- **OpenTelemetry** - Instrumentation and export
+- **Automatic HTTP tracing** - Request/response spans
+- **Automatic gRPC tracing** - Client/server spans
+- **Custom business spans** - Application-specific tracing
+- **Trace propagation** - Headers and metadata
 
 ---
 
-## Chrome extension (optional)
+## Local Development
 
-A simple Manifest V3 extension can **auto-attach `X-Canary: <PR#>`** to your dev domains via `declarativeNetRequest`.
+### Prerequisites
+- **Docker Desktop** with Kubernetes enabled
+- **minikube** (8 CPUs, 32GB RAM)
+- **kubectl**, **helm**, **argocd** CLI
+- **telepresence** for local development
 
-> Remember to add `Access-Control-Allow-Headers: X-Canary` to CORS preflights on your API.
-
----
-
-## Promotion & cleanup lifecycle
-
-1. **PR open** → CI builds image → ApplicationSet creates PR namespace + router.
-2. **Test via `X-Canary: <PR#>`**.
-3. **PR updated** → CI builds new image → ApplicationSet detects new `head_sha` → Rolling update in same namespace.
-4. **PR close/merge** → ApplicationSet stops generating → Argo CD **prunes** PR namespace & router.
-5. **Release** → bump `images:` in `envs/dev/api/stable/kustomization.yaml` to promote.
-
-### PR Update Flow
-
-When developers push new commits to their PR:
-
-```mermaid
-sequenceDiagram
-    participant Dev as Developer
-    participant GH as GitHub
-    participant CI as GitHub Actions
-    participant Reg as Container Registry
-    participant ArgoAS as Argo ApplicationSet
-    participant K8s as Kubernetes
-
-    Dev->>GH: git push (new commits to PR)
-    GH->>CI: Trigger workflow (new GITHUB_SHA)
-    CI->>CI: Build & test new code
-    CI->>Reg: Push image:new-sha-tag
-    
-    Note over ArgoAS: Polls every 2 minutes
-    ArgoAS->>GH: Check PR head_sha
-    GH->>ArgoAS: head_sha changed!
-    ArgoAS->>ArgoAS: Update Application manifest
-    ArgoAS->>K8s: Apply new image tag
-    K8s->>K8s: Rolling update deployment
-    K8s->>Dev: Canary ready with new code
-```
-
-**Key**: Same namespace gets updated, not recreated. Testing URLs remain consistent.
-
-### Faster PR Updates (Optional)
-
-By default, ApplicationSet polls every 2 minutes (`requeueAfterSeconds: 120`). For faster feedback:
-
-**1) GitHub Webhook (Immediate Updates)**
-
-```yaml
-# In ApplicationSet
-spec:
-  generators:
-    - pullRequest:
-        github:
-          owner: rinsecrm
-          repo: api-service
-          tokenRef: { secretName: github-token, key: token }
-        requeueAfterSeconds: 120
-        webhooks:
-          - github:
-              secret: webhook-secret
-```
-
-**2) CI-Triggered Sync**
-
-Add to GitHub Actions workflow:
-
-```yaml
-- name: Trigger Argo Sync
-  run: |
-    curl -X POST \
-      -H "Authorization: Bearer ${{ secrets.ARGOCD_TOKEN }}" \
-      https://argocd.example.com/api/v1/applications/api-canary-pr-${{ github.event.number }}/sync
-```
-
-**3) Manual Developer Refresh**
-
+### Setup
 ```bash
-# Force ApplicationSet refresh
-kubectl annotate applicationset api-pr-canaries \
-  argocd.argoproj.io/refresh=now
+# Start minikube with sufficient resources
+minikube start --memory=32768 --cpus=8
 
-# Or sync specific app
-argocd app sync api-canary-pr-123
+# Deploy infrastructure
+cd localdev
+make infrastructure
+
+# Setup ArgoCD applications
+make argocd-setup
+
+# Start port forwards
+make port-forwards
+```
+
+### Development Workflow
+```bash
+# Intercept service for local development
+telepresence intercept api-service --namespace apps --port 8080
+
+# Run local service
+make dev-run
+
+# Test canary deployment
+curl -H "X-Canary: 123" http://api.localhost/health
 ```
 
 ---
 
-## Security, RBAC & quotas
+## Promotion & Cleanup Lifecycle
 
-* Put all canary apps in an **Argo CD Project** limited to:
+### PR Lifecycle
+1. **PR Created** → GitHub Actions builds `pr-{{ number }}` image
+2. **ApplicationSet Triggers** → Deploys to `<service>-canary-pr-<PR#>` namespace
+3. **Routing Updates** → Traefik/Linkerd route `X-Canary: <PR#>` to canary
+4. **Testing** → Use Chrome extension or curl with header
+5. **PR Updated** → New image built, same namespace updated
+6. **PR Closed** → Argo CD prunes namespace automatically
 
-  * source repos (env manifests),
-  * destination namespaces (e.g., `*-canary-pr-*`),
-  * no cluster-admin.
-* Add **ResourceQuotas/LimitRanges** to PR namespaces.
-* Use **External Secrets** or **Sealed Secrets**; don’t bake secrets into images/overlays.
-
----
-
-## Observability
-
-* Log/metric label e.g., `canary_pr=<PR#>`.
-* Build quick dashboards comparing v1/v2:
-
-  * request rate, error rate, latency percentiles.
-* Optionally export `X-Canary` as `X-Canary-Echo` header in responses for debugging.
-
----
-
-## CORS & client notes
-
-* Add `Access-Control-Allow-Headers: X-Canary` on API preflight responses.
-* Browser tooling:
-
-  * Postman/Insomnia: set header per request.
-  * Chrome extension: auto-inject the header for your dev domain(s).
+### Release Lifecycle
+1. **Tag Created** → Release workflow triggered
+2. **Integration Updated** → Automatically updated to latest
+3. **Staging PR** → Created for review and testing
+4. **Production PR** → Created for review and approval
+5. **GitHub Release** → Created with release notes and artifacts
 
 ---
 
 ## Troubleshooting
 
-* **Header present but API still v1**
+### Common Issues
+- **Header present but API still stable** - Check Traefik IngressRoute match
+- **API routes to canary but backend still stable** - Verify gRPC interceptors
+- **CORS errors** - Add `Access-Control-Allow-Headers: X-Canary`
+- **ApplicationSet didn't create PR app** - Check PAT and repo permissions
+- **No auto-cleanup** - Ensure `automated.prune: true` in ApplicationSet
 
-  * Check Traefik `IngressRoute` match (host/path/header exact value).
-  * Ensure the router points to the **PR namespace** Service.
-* **API routes to v2 but backend still v1**
+### Debugging Commands
+```bash
+# Check ApplicationSet status
+kubectl get applicationset -n argocd
 
-  * Ensure your gRPC interceptors are registered; check that `X-Canary` metadata is present downstream.
-  * Verify Linkerd `GRPCRoute` `value` matches the PR number.
-* **CORS errors**
+# Check PR applications
+kubectl get applications -n argocd | grep canary
 
-  * Missing `Access-Control-Allow-Headers` for `X-Canary`.
-* **ApplicationSet didn’t create PR app**
+# Check routing
+kubectl get ingressroute -n apps
+kubectl get grpcroute -n apps
 
-  * Check PAT, repo/owner names, controller logs; confirm PR generator has permissions.
-* **No auto-cleanup**
-
-  * Ensure ApplicationSet has `automated.prune: true` and PR is actually *closed*.
-
----
-
-## FAQ
-
-**Q: Helm or Kustomize?**
-A: We use **Kustomize** here because ops prefers it; the pattern works identically with Helm.
-
-**Q: Can multiple PRs be tested at once?**
-A: Yes—each PR gets its own namespace and Traefik router rule. Use the corresponding `X-Canary: <PR#>`.
-
-**Q: Do we need edge routing if only backend changed?**
-A: Not strictly. You can keep Traefik stable and rely solely on Linkerd for internal gRPC routing. Use edge routing only when canarying the API itself.
-
-**Q: How do we avoid state collisions?**
-A: Start with read-only paths or clone DB schema/topic for canary writes. Gate mutations behind a feature flag until confident.
-
-**Q: Why not maintain separate v1/v2 manifests?**
-A: **Single base manifests** deployed to different namespaces is simpler—same code paths, same configs, just different namespaces and image tags. Reduces Git bloat and drift.
-
-**Q: How does cross-namespace gRPC routing work?**
-A: **Linkerd GRPCRoute** in the stable namespace routes to services in PR namespaces. **ReferenceGrant** in the target namespace permits the cross-namespace reference.
-
-**Q: What happens when a PR is force-pushed?**
-A: ApplicationSet detects the new SHA and updates the deployment automatically. Same namespace, new image.
-
-**Q: How long does it take for canary updates to deploy?**
-A: By default, ApplicationSet polls every 2 minutes. Add webhooks or CI triggers for immediate updates. Total time: ~2-5 minutes including build + deploy.
-
-**Q: Can I test multiple commits quickly during development?**
-A: Yes! Each push creates a new image. The same canary namespace gets rolling updates. Use `kubectl get pods -w` to watch deployment progress.
-
-**Q: What if I want to roll back to a previous commit in the PR?**
-A: Force-push the previous commit or use `git revert`. CI will build that SHA and ApplicationSet will deploy it to the same canary namespace.
-
----
-
-### Replace-me values
-
-* Registry: `ghcr.io/rinsecrm`
-* Domain: `api.dev.example.com`
-* Namespaces: `apps`, `api-canary-pr-<PR#>`, `store-canary-pr-<PR#>`
-* Repos: `rinsecrm/api-service`, `rinsecrm/store-service`, `rinsecrm/manifests-microservices`
-
----
-
----
-
-## ✅ IMPLEMENTATION STATUS 
-
-This plan has been **fully implemented** with the following improvements:
-
-### ✨ What Was Built
-
-1. **🏪 Store Service** - gRPC backend with DynamoDB
-2. **🌐 API Service** - HTTP REST API with gRPC client  
-3. **📋 Manifests Repository** - Single base manifests (no v1/v2 split)
-4. **🔧 Chrome Extension** - Auto X-Canary header injection
-5. **⚙️ Complete CI/CD** - GitHub Actions + Argo ApplicationSets
-
-### 🎯 Key Architecture Decisions
-
-**✅ Single Base Manifests**: Each service has one `deployment.yaml` and `service.yaml` 
-**✅ Namespace-Based Canaries**: PR creates `<service>-canary-pr-<number>` namespace
-**✅ Cross-Namespace Routing**: GRPCRoute + ReferenceGrant for east-west traffic
-**✅ Simplified ApplicationSets**: Direct base deployment with image patches
-
-### 📂 Repository Structure
-
-```
-.
-├── api-service/           # HTTP service (single base manifests)
-│   └── deploy/           # Kubernetes manifests + stable overlay
-├── store-service/        # gRPC service (single base manifests)
-│   └── deploy/           # Kubernetes manifests + stable overlay
-├── manifests/            # Environment deployments
-│   ├── stable/           # Stable environment configs
-│   └── apps/             # Argo CD ApplicationSets
-├── chrome-extension/     # Browser tooling for testing
-├── README.md             # Complete setup guide
-├── docker-compose.yml    # Local development
-└── Makefile             # Development tasks
+# Check canary pods
+kubectl get pods -n api-canary-pr-123
+kubectl get pods -n store-canary-pr-123
 ```
 
-### 🚦 How It Works
+---
 
-1. **PR Created** → GitHub Actions builds image with `pr-{{ number }}`
-2. **ApplicationSet Triggers** → Deploys base manifests to `<service>-canary-pr-<PR#>` 
-3. **Routing Updates** → Traefik/Linkerd route `X-Canary: <PR#>` to that namespace
-4. **Testing** → Chrome extension or curl with header hits canary
-5. **PR Closed** → Argo CD prunes namespace automatically
+## Current Implementation Status
 
-This implementation is **production-ready** and follows the exact pattern outlined in this plan, but with the cleaner single-manifest approach you described.
+### ✅ Completed
+- **Service Architecture** - API and Store services with proper separation
+- **Centralized Manifests** - Single source of truth in manifests-microservices
+- **PR Canary Deployments** - Full ApplicationSet automation
+- **Observability Stack** - Prometheus, Grafana, Tempo, Loki
+- **Local Development** - Complete minikube setup with Telepresence
+- **CI/CD Pipelines** - Generic GitHub Actions workflows
+- **Chrome Extension** - Browser tooling for testing
+- **Documentation** - Comprehensive READMEs and guides
+
+### 🎯 Key Features
+- **Single Base Manifests** - No v1/v2 duplication
+- **Environment-Centric Structure** - Production, staging, integration
+- **Cross-Namespace Routing** - GRPCRoute + ReferenceGrant
+- **Automatic Cleanup** - PR namespaces pruned on close
+- **Generic Workflows** - Reusable across services
+- **Full Observability** - Metrics, logs, and traces
+
+This implementation is **production-ready** and follows modern GitOps practices with comprehensive observability and developer experience.
