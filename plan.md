@@ -41,16 +41,16 @@
 ## Architecture
 
 * **Web → API (HTTP)** routed by **Traefik**:
-  * `X-Canary: <PR#>` → **`api-service`** in **`api-canary-pr-<PR#>`** namespace
+  * `X-Canary: <PR#>` → **`api-service-pr-<PR#>`** in **`apps`** namespace
   * otherwise → **`api-service`** in **`apps`** namespace (stable)
 
 * **API → Store (gRPC)** routed by **Linkerd (Gateway API)**:
   * Same `X-Canary` value propagated as **gRPC metadata**.
-  * `X-Canary: <PR#>` → **`store-service`** in **`store-canary-pr-<PR#>`** namespace
+  * `X-Canary: <PR#>` → **`store-service-pr-<PR#>`** in **`apps`** namespace
   * otherwise → **`store-service`** in **`apps`** namespace (stable)
 
-> You'll run **the same base manifests** in different namespaces per PR.
-> Cross-namespace routing via GRPCRoute + ReferenceGrant enables east-west traffic.
+> You'll run **the same base manifests** with different service names per PR.
+> All services deploy to the `apps` namespace with distinct names for canary routing.
 
 ---
 
@@ -193,7 +193,7 @@ manifests-microservices/
 ### Single Base Manifest Approach
 - **One deployment.yaml per service** - no v1/v2 duplication
 - **Environment-specific overlays** - patch image tags and configurations
-- **PR canaries** - ApplicationSets patch image tags dynamically
+- **PR canaries** - ApplicationSets patch service names and image tags dynamically
 
 ---
 
@@ -228,8 +228,8 @@ spec:
   routes:
     - match: Host(`api.localhost`) && Headers(`X-Canary`, `{{ number }}`)
       services:
-        - name: api-service
-          namespace: api-canary-pr-{{ number }}
+        - name: api-service-pr-{{ number }}
+          namespace: apps
           port: 80
 ```
 
@@ -237,7 +237,7 @@ spec:
 
 ## Linkerd Routing
 
-### Cross-Namespace gRPC Routing
+### Same-Namespace gRPC Routing
 ```yaml
 apiVersion: gateway.networking.k8s.io/v1
 kind: GRPCRoute
@@ -254,8 +254,8 @@ spec:
             - name: X-Canary
               value: "{{ number }}"
       backendRefs:
-        - name: store-service
-          namespace: store-canary-pr-{{ number }}
+        - name: store-service-pr-{{ number }}
+          namespace: apps
           port: 80
     - backendRefs:
         - name: store-service
@@ -263,23 +263,7 @@ spec:
           port: 80
 ```
 
-### Reference Grant
-```yaml
-apiVersion: gateway.networking.k8s.io/v1beta1
-kind: ReferenceGrant
-metadata:
-  name: allow-apps-grpcroute
-  namespace: store-canary-pr-{{ number }}
-spec:
-  from:
-    - group: gateway.networking.k8s.io
-      kind: GRPCRoute
-      namespace: apps
-  to:
-    - group: ""
-      kind: Service
-      name: store-service
-```
+> **No ReferenceGrant needed** - All services are in the same namespace, so cross-namespace routing permissions are not required.
 
 ---
 
@@ -304,9 +288,9 @@ manifests-microservices/
 ```
 
 ### PR Canary ApplicationSets
-- **API Service**: Deploys base manifests to PR namespace
-- **Store Service**: Deploys base manifests to PR namespace  
-- **Store Routing**: Creates GRPCRoute + ReferenceGrant for cross-namespace access
+- **API Service**: Deploys base manifests with canary service names to apps namespace
+- **Store Service**: Deploys base manifests with canary service names to apps namespace  
+- **Store Routing**: Creates GRPCRoute for same-namespace canary routing
 
 ---
 
@@ -402,11 +386,11 @@ curl -H "X-Canary: 123" http://api.localhost/health
 
 ### PR Lifecycle
 1. **PR Created** → GitHub Actions builds `pr-{{ number }}` image
-2. **ApplicationSet Triggers** → Deploys to `<service>-canary-pr-<PR#>` namespace
-3. **Routing Updates** → Traefik/Linkerd route `X-Canary: <PR#>` to canary
+2. **ApplicationSet Triggers** → Deploys to `apps` namespace with canary service names
+3. **Routing Updates** → Traefik/Linkerd route `X-Canary: <PR#>` to canary services
 4. **Testing** → Use Chrome extension or curl with header
-5. **PR Updated** → New image built, same namespace updated
-6. **PR Closed** → Argo CD prunes namespace automatically
+5. **PR Updated** → New image built, same canary services updated
+6. **PR Closed** → Argo CD prunes canary applications automatically
 
 ### Release Lifecycle
 1. **Tag Created** → Release workflow triggered
@@ -438,9 +422,9 @@ kubectl get applications -n argocd | grep canary
 kubectl get ingressroute -n apps
 kubectl get grpcroute -n apps
 
-# Check canary pods
-kubectl get pods -n api-canary-pr-123
-kubectl get pods -n store-canary-pr-123
+# Check canary services and pods
+kubectl get services -n apps | grep pr-
+kubectl get pods -n apps | grep pr-
 ```
 
 ---
