@@ -6,15 +6,27 @@ This repository demonstrates a complete implementation of PR-scoped canary deplo
 
 ```
 .
-├── api-service/           # HTTP API service (Go + Gorilla Mux)
-│   └── deploy/            # Kubernetes manifests for API service
-├── store-service/         # gRPC backend service (Go + DynamoDB) 
-│   └── deploy/            # Kubernetes manifests for store service
-├── manifests/             # Environment-specific deployments
-│   ├── stable/            # Stable environment configs
-│   └── apps/              # Argo CD ApplicationSets
-├── chrome-extension/      # Browser extension for X-Canary header injection
-└── plan.md               # Detailed implementation plan
+├── api-service/                    # HTTP API service (Go + Gorilla Mux)
+│   ├── .github/workflows/         # CI/CD workflows
+│   ├── internal/                  # Application code
+│   └── proto/                     # Protocol buffer definitions
+├── store-service/                  # gRPC backend service (Go + DynamoDB) 
+│   ├── .github/workflows/         # CI/CD workflows
+│   ├── internal/                  # Application code
+│   └── proto/                     # Protocol buffer definitions
+├── manifests-microservices/        # Centralized manifests repository
+│   ├── applications/              # ArgoCD Application manifests
+│   │   ├── production/            # Production environment
+│   │   ├── staging/               # Staging environment
+│   │   └── integration-001/       # Integration environment + PR canaries
+│   ├── kustomize/                 # Kustomize configurations
+│   │   ├── api-service/           # API service manifests
+│   │   └── store-service/         # Store service manifests
+│   └── .github/workflows/         # Cleanup workflows
+├── extension-canary/              # Browser extension for X-Canary header injection
+└── docs/                          # Documentation
+    ├── README.md                  # This file
+    └── plan.md                    # Detailed implementation plan
 ```
 
 ## Services
@@ -29,7 +41,7 @@ This repository demonstrates a complete implementation of PR-scoped canary deplo
 - **Technology**: Go, gRPC server, DynamoDB, following [store-automations](https://github.com/nicklanng/store-automations) patterns
 - **Purpose**: Multi-tenant store management with inventory tracking
 - **Features**: Enhanced data model, structured logging, comprehensive API
-- **Canary Routing**: Linkerd GRPCRoute based on `x-canary` metadata
+- **Canary Routing**: Linkerd GRPCRoute based on `X-Canary` metadata
 - **Port**: 8080
 
 ## Quick Start
@@ -44,33 +56,35 @@ This repository demonstrates a complete implementation of PR-scoped canary deplo
 
 ```bash
 # Deploy stable versions
-kubectl apply -k manifests/stable/api/
-kubectl apply -k manifests/stable/store/
+kubectl apply -k manifests-microservices/kustomize/api-service/overlays/production/
+kubectl apply -k manifests-microservices/kustomize/store-service/overlays/production/
 ```
 
-### 2. Setup Argo CD ApplicationSets
+### 2. Setup Argo CD Applications
 
 ```bash
-# Apply ApplicationSets for PR-scoped deployments
-kubectl apply -f manifests/apps/
+# Apply ArgoCD applications for all environments
+kubectl apply -f manifests-microservices/applications/production/
+kubectl apply -f manifests-microservices/applications/staging/
+kubectl apply -f manifests-microservices/applications/integration-001/
 ```
 
 ### 3. Configure GitHub Secrets
 
 Add these secrets to your GitHub repositories:
-- `REGISTRY_USER` - Container registry username
-- `REGISTRY_PASS` - Container registry password
 
-**Optional (for faster updates):**
-- `ARGOCD_SERVER` - Argo CD server URL (e.g., `https://argocd.example.com`)
-- `ARGOCD_TOKEN` - Argo CD API token for immediate sync triggers
+**For service repositories (`api-service`, `store-service`):**
+- `MANIFESTS_TOKEN` - GitHub Personal Access Token with `repo` permissions for updating manifests
+
+**For manifests repository (`manifests-microservices`):**
+- `GITHUB_TOKEN` - Automatically provided by GitHub Actions
 
 ### 4. Test Canary Deployment
 
 1. Create a PR in either service repository
 2. Wait for GitHub Actions to build and push the image
 3. Argo CD will automatically create the canary deployment (within 2 minutes)
-4. Test with: `curl -H "X-Canary: <PR#>" https://api.dev.example.com/api/v1/items`
+4. Test with: `curl -H "X-Canary: <PR#>" https://api.dev.example.com/health`
 
 ### 5. Update Canary During Development
 
@@ -84,12 +98,12 @@ Add these secrets to your GitHub repositories:
 ## Canary Routing
 
 ### HTTP (Edge) - Traefik
-- **Stable**: All requests → `api` service in `platform` namespace  
-- **Canary**: Requests with `X-Canary: <PR#>` → `api` service in `api-canary-pr-<PR#>` namespace
+- **Stable**: All requests → `api` service in `apps` namespace  
+- **Canary**: Requests with `X-Canary: <PR#>` → `api` service in `apps` namespace
 
 ### gRPC (East-West) - Linkerd
-- **Stable**: All requests → `store` service in `backoffice` namespace
-- **Canary**: Requests with `x-canary: <PR#>` metadata → `store` service in `store-canary-pr-<PR#>` namespace via cross-namespace GRPCRoute with ReferenceGrant
+- **Stable**: All requests → `store` service in `apps` namespace
+- **Canary**: Requests with `X-Canary: <PR#>` metadata → `store` service in `apps` namespace via cross-namespace GRPCRoute with ReferenceGrant
 
 ## Chrome Extension
 
@@ -103,9 +117,9 @@ Install the browser extension from `chrome-extension/` to automatically inject X
 ## Configuration
 
 Update these values in the manifests:
-- `registry.example.com` → your container registry
+- `ghcr.io/rinsecrm` → your container registry
 - `api.dev.example.com` → your API domain
-- `your-org` → your GitHub organization
+- `rinsecrm` → your GitHub organization
 - Namespace names as needed
 
 ## Observability
@@ -121,8 +135,11 @@ PR deployments automatically clean up when PRs are closed, thanks to Argo CD's p
 
 For manual cleanup:
 ```bash
-kubectl delete namespace api-canary-pr-<PR#>
-kubectl delete namespace store-canary-pr-<PR#>
+kubectl delete application api-service-canary-pr-<PR#>
+kubectl delete application store-service-canary-pr-<PR#>
+kubectl delete application api-service-canary-router-pr-<PR#>
+kubectl delete application store-service-routing-pr-<PR#>
+kubectl delete application store-service-reference-grant-pr-<PR#>
 ```
 
 ## Troubleshooting PR Updates
@@ -132,7 +149,7 @@ kubectl delete namespace store-canary-pr-<PR#>
 1. **Check if image was built:**
    ```bash
    # Check GitHub Actions for your PR
-   # Look for new image tag: registry.example.com/api-service:<new-sha>
+   # Look for new image tag: ghcr.io/rinsecrm/api-service:pr-<PR#>
    ```
 
 2. **Check ApplicationSet status:**

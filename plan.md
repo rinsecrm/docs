@@ -53,12 +53,12 @@
 * **Web → API (HTTP)** routed by **Traefik**:
 
   * `X-Canary: <PR#>` → **`api`** service in **`api-canary-pr-<PR#>`** namespace
-  * otherwise → **`api`** service in **`platform`** namespace (stable)
+  * otherwise → **`api`** service in **`apps`** namespace (stable)
 * **API → backend (gRPC)** routed by **Linkerd (Gateway API)**:
 
-  * Same `x-canary` value propagated as **gRPC metadata**.
-  * `x-canary: <PR#>` → **`store`** service in **`store-canary-pr-<PR#>`** namespace
-  * otherwise → **`store`** service in **`backoffice`** namespace (stable)
+  * Same `X-Canary` value propagated as **gRPC metadata**.
+  * `X-Canary: <PR#>` → **`store`** service in **`store-canary-pr-<PR#>`** namespace
+  * otherwise → **`store`** service in **`apps`** namespace (stable)
 
 > You'll run **the same base manifests** in different namespaces per PR.
 > An **apex Service** in the stable namespace fronts back-office services with **cross-namespace routing** via GRPCRoute + ReferenceGrant.
@@ -102,7 +102,7 @@ repo-root/
           kustomization.yaml
         canary/
           kustomization.yaml
-  services/billing/         # example back-office svc (gRPC)
+  services/store/           # gRPC backend service
     deploy/...
   envs/
     apps/
@@ -147,7 +147,7 @@ spec:
     spec:
       containers:
         - name: api
-          image: registry.example.com/api:STABLE_TAG   # patched per env/PR
+          image: ghcr.io/rinsecrm/api-service:STABLE_TAG   # patched per env/PR
           ports: [{ containerPort: 8080 }]
 ```
 
@@ -183,9 +183,9 @@ kind: Kustomization
 resources:
   - ../../../../services/api/deploy/base
   - ingressroute.yaml  # stable Traefik routing
-namespace: platform
+namespace: apps
 images:
-  - name: registry.example.com/api
+  - name: ghcr.io/rinsecrm/api-service
     newTag: v1.0.0   # promotion bumps this
 ```
 
@@ -205,8 +205,8 @@ The **`store`** service uses the same single-manifest approach. The apex Service
 apiVersion: gateway.networking.k8s.io/v1
 kind: GRPCRoute
 metadata:
-  name: store-canary-pr-PLACEHOLDER
-  namespace: backoffice  # stable namespace where apex service lives
+  name: store-canary-pr-{{ number }}
+  namespace: apps  # stable namespace where apex service lives
 spec:
   parentRefs:
     - kind: Service
@@ -214,15 +214,15 @@ spec:
   rules:
     - matches:
         - headers:
-            - name: x-canary
-              value: "PLACEHOLDER"
+            - name: X-Canary
+              value: "{{ number }}"
       backendRefs:
         - name: store
-          namespace: store-canary-pr-PLACEHOLDER  # cross-namespace reference
+          namespace: store-canary-pr-{{ number }}  # cross-namespace reference
           port: 80
     - backendRefs:
         - name: store
-          namespace: backoffice  # stable namespace
+          namespace: apps  # stable namespace
           port: 80
 ```
 
@@ -232,13 +232,13 @@ spec:
 apiVersion: gateway.networking.k8s.io/v1beta1
 kind: ReferenceGrant
 metadata:
-  name: allow-backoffice-grpcroute
-  namespace: store-canary-pr-PLACEHOLDER  # target namespace
+  name: allow-apps-grpcroute
+  namespace: store-canary-pr-{{ number }}  # target namespace
 spec:
   from:
     - group: gateway.networking.k8s.io
       kind: GRPCRoute
-      namespace: backoffice         # the route lives here
+      namespace: apps         # the route lives here
   to:
     - group: ""                     # core/v1 Service
       kind: Service
@@ -274,14 +274,14 @@ spec:
 
 ## Traefik routing (edge) — Namespace-based routing
 
-**Stable** (everyone → `api` service in `platform` namespace):
+**Stable** (everyone → `api` service in `apps` namespace):
 
 ```yaml
 apiVersion: traefik.containo.us/v1alpha1
 kind: IngressRoute
 metadata:
   name: api-stable
-  namespace: platform
+  namespace: apps
 spec:
   entryPoints: [ websecure ]
   routes:
@@ -289,7 +289,7 @@ spec:
       kind: Rule
       services:
         - name: api
-          namespace: platform
+          namespace: apps
           port: 80
   tls: {}
 ```
@@ -300,16 +300,16 @@ spec:
 apiVersion: traefik.containo.us/v1alpha1
 kind: IngressRoute
 metadata:
-  name: api-canary-pr-PLACEHOLDER
-  namespace: platform
+  name: api-canary-pr-{{ number }}
+  namespace: apps
 spec:
   entryPoints: [ websecure ]
   routes:
-    - match: Host(`api.dev.example.com`) && PathPrefix(`/`) && Headers(`X-Canary`, `PLACEHOLDER`)
+    - match: Host(`api.dev.example.com`) && PathPrefix(`/`) && Headers(`X-Canary`, `{{ number }}`)
       kind: Rule
       services:
         - name: api
-          namespace: api-canary-pr-PLACEHOLDER
+          namespace: api-canary-pr-{{ number }}
           port: 80
   tls: {}
 ```
@@ -326,8 +326,8 @@ Per-PR **`GRPCRoute`** for cross-namespace canary routing:
 apiVersion: gateway.networking.k8s.io/v1
 kind: GRPCRoute
 metadata:
-  name: store-canary-pr-PLACEHOLDER
-  namespace: backoffice  # stable namespace where apex service lives
+  name: store-canary-pr-{{ number }}
+  namespace: apps  # stable namespace where apex service lives
 spec:
   parentRefs:
     - kind: Service
@@ -335,15 +335,15 @@ spec:
   rules:
     - matches:
         - headers:
-            - name: x-canary
-              value: "PLACEHOLDER"
+            - name: X-Canary
+              value: "{{ number }}"
       backendRefs:
         - name: store
-          namespace: store-canary-pr-PLACEHOLDER  # cross-namespace!
+          namespace: store-canary-pr-{{ number }}  # cross-namespace!
           port: 80
     - backendRefs:
         - name: store
-          namespace: backoffice  # stable
+          namespace: apps  # stable
           port: 80
 ```
 
@@ -353,13 +353,13 @@ spec:
 apiVersion: gateway.networking.k8s.io/v1beta1
 kind: ReferenceGrant
 metadata:
-  name: allow-backoffice-grpcroute
-  namespace: store-canary-pr-PLACEHOLDER
+  name: allow-apps-grpcroute
+  namespace: store-canary-pr-{{ number }}
 spec:
   from:
     - group: gateway.networking.k8s.io
       kind: GRPCRoute
-      namespace: backoffice
+      namespace: apps
   to:
     - group: ""
       kind: Service
@@ -390,7 +390,7 @@ spec:
   generators:
     - pullRequest:
         github:
-          owner: your-org
+          owner: rinsecrm
           repo: api-service
           tokenRef: { secretName: github-token, key: token }
         requeueAfterSeconds: 120
@@ -404,7 +404,7 @@ spec:
         server: https://kubernetes.default.svc
         namespace: api-canary-pr-{{ number }}
       source:
-        repoURL: https://github.com/your-org/api-service.git
+        repoURL: https://github.com/rinsecrm/api-service.git
         targetRevision: "{{ head_sha }}"
         path: deploy/base
         kustomize:
@@ -413,11 +413,11 @@ spec:
               patch: |-
                 - op: replace
                   path: /spec/template/spec/containers/0/image
-                  value: registry.example.com/api:{{ head_short_sha }}
+                  value: ghcr.io/rinsecrm/api-service:pr-{{ number }}
       syncPolicy:
         automated: { prune: true, selfHeal: true }
         syncOptions:
-          - CreateNamespace=true
+          # CreateNamespace removed - using apps namespace
 ```
 
 **2) Edge router per PR (Traefik `IngressRoute`)**
@@ -434,7 +434,7 @@ spec:
   generators:
     - pullRequest:
         github:
-          owner: your-org
+          owner: rinsecrm
           repo: api-service
           tokenRef: { secretName: github-token, key: token }
         requeueAfterSeconds: 120
@@ -446,14 +446,14 @@ spec:
       project: canary-deployments
       destination:
         server: https://kubernetes.default.svc
-        namespace: platform
+        namespace: apps
       source:
-        repoURL: https://github.com/your-org/api-service.git
+        repoURL: https://github.com/rinsecrm/api-service.git
         targetRevision: "{{ head_sha }}"
         path: deploy/edge
         kustomize:
           patches:
-            - target: { apiVersion: traefik.containo.us/v1alpha1, kind: IngressRoute, name: api-canary-pr-PLACEHOLDER }
+            - target: { apiVersion: traefik.containo.us/v1alpha1, kind: IngressRoute, name: api-canary-pr-{{ number }} }
               patch: |-
                 - op: replace
                   path: /metadata/name
@@ -491,23 +491,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build & push
-        env: { IMAGE: registry.example.com/api }
+        env: { IMAGE: ghcr.io/rinsecrm/api-service }
         run: |
           TAG=${GITHUB_SHA::8}
           docker build -t $IMAGE:$TAG services/api
-          echo "${{ secrets.REGISTRY_PASS }}" | docker login registry.example.com -u "${{ secrets.REGISTRY_USER }}" --password-stdin
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
           docker push $IMAGE:$TAG
 ```
 
-> ApplicationSet will use `{{ head_short_sha }}` to pick the matching image tag.
+> ApplicationSet will use `pr-{{ number }}` to pick the matching image tag.
 
 ---
 
 ## Go wiring (summary)
 
 * **Gorilla/Mux middleware**: read `X-Canary` (digits only), stash in `context`.
-* **gRPC server interceptor**: read incoming `x-canary` metadata, re-stash in context.
-* **gRPC client interceptor**: read from context, set `x-canary` on outgoing calls.
+* **gRPC server interceptor**: read incoming `X-Canary` metadata, re-stash in context.
+* **gRPC client interceptor**: read from context, set `X-Canary` on outgoing calls.
 * This allows Traefik to route HTTP to `api-v2` and Linkerd to route gRPC to `*-v2`.
 
 > You can keep this in a small internal package (e.g., `internal/canaryctx`) and a common RPC module for interceptors.
@@ -571,7 +571,7 @@ spec:
   generators:
     - pullRequest:
         github:
-          owner: your-org
+          owner: rinsecrm
           repo: api-service
           tokenRef: { secretName: github-token, key: token }
         requeueAfterSeconds: 120
@@ -645,7 +645,7 @@ argocd app sync api-canary-pr-123
   * Ensure the router points to the **PR namespace** Service.
 * **API routes to v2 but backend still v1**
 
-  * Ensure your gRPC interceptors are registered; check that `x-canary` metadata is present downstream.
+  * Ensure your gRPC interceptors are registered; check that `X-Canary` metadata is present downstream.
   * Verify Linkerd `GRPCRoute` `value` matches the PR number.
 * **CORS errors**
 
@@ -695,10 +695,10 @@ A: Force-push the previous commit or use `git revert`. CI will build that SHA an
 
 ### Replace-me values
 
-* Registry: `registry.example.com`
+* Registry: `ghcr.io/rinsecrm`
 * Domain: `api.dev.example.com`
-* Namespaces: `platform`, `api-canary-pr-<PR#>`, `backoffice`
-* Repos: `your-org/your-service-repo`, `your-org/envs`
+* Namespaces: `apps`, `api-canary-pr-<PR#>`, `store-canary-pr-<PR#>`
+* Repos: `rinsecrm/api-service`, `rinsecrm/store-service`, `rinsecrm/manifests-microservices`
 
 ---
 
@@ -742,7 +742,7 @@ This plan has been **fully implemented** with the following improvements:
 
 ### 🚦 How It Works
 
-1. **PR Created** → GitHub Actions builds image with `{{ head_short_sha }}`
+1. **PR Created** → GitHub Actions builds image with `pr-{{ number }}`
 2. **ApplicationSet Triggers** → Deploys base manifests to `<service>-canary-pr-<PR#>` 
 3. **Routing Updates** → Traefik/Linkerd route `X-Canary: <PR#>` to that namespace
 4. **Testing** → Chrome extension or curl with header hits canary
